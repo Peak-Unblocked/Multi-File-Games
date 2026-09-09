@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en-us">
+<head>
+  <!-- To serve the assets from a CDN instead of from alongside this file,
+       uncomment this and point it at the asset folder. Everything below follows
+       document.baseURI (including the AudioWorklet), so it is the only change needed.
+  <base href="https://cdn.jsdelivr.net/gh/NotRexed/Unblocked-Games@latest/diceamillion/"> -->
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+  <meta name="viewport" content="viewport-fit=cover, width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0" />
+  <title>Dice a Million</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+    #canvas { position: fixed; top: 0; left: 0; transform-origin: top left; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+
+  <script>
+  /* ------------------------------------------------------------------
+     Split-asset loader.
+
+     Anything too large to host in one piece is uploaded as <name>.part1,
+     <name>.part2, ... and stitched back together here. Nothing is
+     hardcoded: at boot each candidate is probed for a .part1, and the
+     part count is discovered by probing outwards. Re-split a file into a
+     different number of pieces and this page needs no edit - only the
+     parts have to be present, never the original.
+     ------------------------------------------------------------------ */
+
+  /* Asset root. Follows <base> when one is present, otherwise this page's own
+     folder, so the same file works served locally and from a CDN. */
+  var ASSET_BASE = new URL('.', document.baseURI).href;
+
+  /* Assets that may have been split. Probed at boot; ones with no .part1
+     are left alone and requested normally. */
+  var SPLIT_CANDIDATES = ['runner.data', 'mus.dat', 'snd.dat', 'game.unx'];
+
+  var PROBE_BATCH = 4;    /* parts probed per round trip once a split is found */
+  var MAX_PARTS = 64;     /* refuse to probe forever if something is wrong */
+
+  /* name -> part count, filled in by discoverSplitAssets() before the
+     runner is allowed to start. */
+  var SPLIT = {};
+
+  function partUrl(name, i) { return ASSET_BASE + name + '.part' + i; }
+
+  function exists(url) {
+    return fetch(url, { method: 'HEAD' })
+      .then(function (r) { return r.ok; })
+      .catch(function () { return false; });
+  }
+
+  /* Count contiguous parts starting at .part1. A single probe settles
+     whether an asset is split at all, so assets that are not split cost one
+     request; only split ones go on to probe outwards PROBE_BATCH at a time. */
+  function countParts(name) {
+    return exists(partUrl(name, 1)).then(function (isSplit) {
+      if (!isSplit) return 0;
+
+      function batch(start) {
+        var probes = [];
+        for (var i = start; i < start + PROBE_BATCH && i <= MAX_PARTS; i++) probes.push(exists(partUrl(name, i)));
+        if (!probes.length) return start - 1;
+        return Promise.all(probes).then(function (res) {
+          var k = 0;
+          while (k < res.length && res[k]) k++;
+          if (k === res.length) return batch(start + k);
+          return start - 1 + k;
+        });
+      }
+      return batch(2);
+    });
+  }
+
+  function discoverSplitAssets() {
+    return Promise.all(SPLIT_CANDIDATES.map(function (name) {
+      return countParts(name).then(function (n) {
+        if (n > 0) SPLIT[name] = n;
+      });
+    })).then(function () {
+      var names = Object.keys(SPLIT);
+      console.log(names.length
+        ? '[split] found ' + names.map(function (n) { return n + ' (' + SPLIT[n] + ' parts)'; }).join(', ')
+        : '[split] no split assets found - loading everything whole');
+    });
+  }
+
+  /* Fetch every part in parallel and concatenate into one ArrayBuffer. */
+  function joinParts(name) {
+    var count = SPLIT[name];
+    var urls = [];
+    for (var i = 1; i <= count; i++) urls.push(partUrl(name, i));
+    return Promise.all(urls.map(function (u) {
+      return fetch(u).then(function (r) {
+        if (!r.ok) throw new Error(u + ' -> HTTP ' + r.status);
+        return r.arrayBuffer();
+      });
+    })).then(function (bufs) {
+      var total = 0, i;
+      for (i = 0; i < bufs.length; i++) total += bufs[i].byteLength;
+      var out = new Uint8Array(total), off = 0;
+      for (i = 0; i < bufs.length; i++) {
+        out.set(new Uint8Array(bufs[i]), off);
+        off += bufs[i].byteLength;
+      }
+      console.log('[split] ' + name + ' reassembled from ' + count + ' parts (' + total + ' bytes)');
+      return out.buffer;
+    });
+  }
+
+  /* Which split asset, if any, a URL is asking for. */
+  function splitNameFor(url) {
+    if (typeof url !== 'string' || url.indexOf('.part') !== -1) return null;
+    for (var k in SPLIT) if (url.indexOf(k) !== -1) return k;
+    return null;
+  }
+  </script>
+
+  <script>
+  /* ------------------------------------------------------------------
+     Canvas scaler.
+
+     The runner sets canvas.width/height (the render target) and also tries
+     to drive canvas.style.width/height. Two things sizing the same element
+     fight each other, so the style setters are neutered and the element is
+     stretched to the viewport with a transform instead.
+     ------------------------------------------------------------------ */
+  var canvas = document.getElementById('canvas');
+
+  var origSetProperty = canvas.style.setProperty.bind(canvas.style);
+  canvas.style.setProperty = function (prop, val, priority) {
+    if (prop === 'width' || prop === 'height') return;
+    return origSetProperty(prop, val, priority);
+  };
+
+  ['width', 'height'].forEach(function (prop) {
+    Object.defineProperty(canvas.style, prop, {
+      set: function () {},
+      get: function () { return ''; },
+      configurable: true
+    });
+  });
+
+  function scaleCanvas() {
+    var cw = canvas.width, ch = canvas.height;
+    if (!cw || !ch) return;
+    var scaleX = window.innerWidth / cw;
+    var scaleY = window.innerHeight / ch;
+    canvas.style.transform = 'scale(' + scaleX + ', ' + scaleY + ')';
+  }
+
+  new MutationObserver(scaleCanvas).observe(canvas, { attributes: true, attributeFilter: ['width', 'height'] });
+  window.addEventListener('resize', scaleCanvas);
+  setInterval(scaleCanvas, 200);
+  </script>
+
+  <script>
+  /* ------------------------------------------------------------------
+     Serve split files to the runner transparently.
+
+     GameMaker pulls game.unx / snd.dat / mus.dat through an XHR that reads
+     .status, .response and fires .onload. Intercept open() for any split
+     asset, stitch the parts, and hand back the joined buffer.
+     (runner.data is excluded - it goes through Module.getPreloadedPackage
+     below, which the runner consults before it ever opens an XHR.)
+     ------------------------------------------------------------------ */
+  var _open = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url) {
+    var rest = Array.prototype.slice.call(arguments, 2);
+    var name = splitNameFor(url);
+
+    if (name && name !== 'runner.data') {
+      var xhr = this;
+      this.send = function () {
+        joinParts(name).then(function (buf) {
+          Object.defineProperty(xhr, 'response', { value: buf, configurable: true });
+          Object.defineProperty(xhr, 'status', { value: 200, configurable: true });
+          Object.defineProperty(xhr, 'readyState', { value: 4, configurable: true });
+          if (xhr.onreadystatechange) xhr.onreadystatechange();
+          if (xhr.onload) xhr.onload();
+          try { xhr.dispatchEvent(new Event('load')); } catch (e) {}
+        })['catch'](function (err) {
+          console.error('[split] ' + name + ' failed:', err);
+          if (xhr.onerror) xhr.onerror(err);
+        });
+      };
+    }
+
+    return _open.apply(this, [method, url].concat(rest));
+  };
+  </script>
+
+  <script>
+  /* Globals runner.js expects the host page to provide. */
+  function manifestFiles() {
+    return ["runner.data","runner.js","runner.wasm","audio-worklet.js","game.unx","mus.dat","snd.dat"].join(";");
+  }
+  function manifestFilesMD5() {
+    return ["bb6142ec21a2789267e542c4c38cba56","d7cda034949d7a25b91df4e5706946e7","6344cea96b6757c3753745b7ebf72d7d","5d0a0227c50a283fe2af3066b3b0a104","80c0ab47c0cbcbe0f49e2e560c749d1c","46b0c4b976a150dd2926cd5560894172","500b1a404adcbb0c18b79f30c1c32cd5"];
+  }
+  function onFirstFrameRendered() {}
+  var g_pWadLoadCallback = undefined;
+  function setWadLoadCallback(cb) { g_pWadLoadCallback = cb; if (cb) cb(); }
+  var g_pAddAsyncMethod = -1;
+  function setAddAsyncMethod(m) { g_pAddAsyncMethod = m; }
+  var g_pJSExceptionHandler = undefined;
+  function setJSExceptionHandler(h) { g_pJSExceptionHandler = h; }
+  function hasJSExceptionHandler() { return typeof g_pJSExceptionHandler === 'function'; }
+  function doJSExceptionHandler(j) { if (hasJSExceptionHandler()) g_pJSExceptionHandler(JSON.parse(j)); }
+  </script>
+
+  <script>
+  var Module = {
+    preRun: [],
+    postRun: [],
+    print: function (text) { console.log(text); },
+    printErr: function (text) { console.error(text); },
+    canvas: document.getElementById('canvas'),
+    setStatus: function (text) { if (text) console.log('Status:', text); },
+    totalDependencies: 0,
+    monitorRunDependencies: function (left) {
+      this.totalDependencies = Math.max(this.totalDependencies, left);
+    },
+    /* runner.js is injected as a blob, so it cannot work out its own folder.
+       Resolve every asset against ASSET_BASE instead. */
+    locateFile: function (path) {
+      if (/^(https?:|blob:|data:|\/\/)/.test(path)) return path;
+      return ASSET_BASE + path;
+    },
+    audioContext: (function () {
+      try {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        return new AC();
+      } catch (e) { return null; }
+    })()
+  };
+
+  document.addEventListener('click', function () {
+    if (Module.audioContext && Module.audioContext.state === 'suspended') {
+      Module.audioContext.resume();
+    }
+  }, { once: true });
+  </script>
+
+  <script>
+  (function () {
+    /* Discover what is split before anything can request it, then hand
+       runner.data over up front - the runner asks for that one
+       synchronously, so it cannot be stitched on demand. */
+    discoverSplitAssets().then(function () {
+      if (!SPLIT['runner.data']) return null;
+      return joinParts('runner.data').then(function (pkg) {
+        Module.getPreloadedPackage = function (url, size) {
+          if (typeof url === 'string' && url.indexOf('runner.data') !== -1) {
+            if (size && pkg.byteLength !== size) {
+              console.warn('[split] runner.data is ' + pkg.byteLength + ' bytes, runner expected ' + size + ' - parts may be stale');
+            }
+            return pkg;
+          }
+          return null;
+        };
+      });
+    }).then(function () {
+      return fetch(ASSET_BASE + 'runner.js');
+    }).then(function (res) {
+      if (!res.ok) throw new Error('runner.js -> HTTP ' + res.status);
+      return res.text();
+    }).then(function (text) {
+      /* A blob-hosted script resolves Worker paths against the blob URL, so
+         make any it creates absolute first. */
+      text = text.replace(/new Worker\(["']([^"']+)["']\)/g, function (match, url) {
+        if (!/^(https?:|blob:|data:)/.test(url)) return 'new Worker("' + ASSET_BASE + url + '")';
+        return match;
+      });
+
+      var blob = new Blob([text], { type: 'application/javascript' });
+      var script = document.createElement('script');
+      script.src = URL.createObjectURL(blob);
+      document.body.appendChild(script);
+    })['catch'](function (err) {
+      console.error('[boot] failed to start:', err);
+    });
+  })();
+  </script>
+</body>
+</html>
